@@ -2,6 +2,22 @@
 
 このファイルはClaude Code用のプロジェクト固有メモ。公式のプロジェクトルールは `AGENTS.md` 参照。
 
+## リポジトリ構成（重要）
+
+このリポジトリは **公式ではなく他人のforkをclone** した状態から始まっている。remote構成:
+
+| remote | URL | 用途 |
+|--------|-----|------|
+| `origin` | buchi-neko/codex-desktop-linux | **自分のfork（push先）** |
+| `upstream` | ilysenko/codex-desktop-linux | 公式（pull元） |
+| `robustonian` | robustonian/codex-desktop-linux | 元origin（参考用に保持） |
+
+**運用ルール:**
+- 個人メモ（CLAUDE.md / operations/）は `personal/notes` ブランチに置く
+- `upstream-main` ブランチは公式追従専用（`git pull --ff-only upstream main`）
+- 個人ブランチに公式変更を取り込む: `git checkout personal/notes && git merge upstream/main`
+- **絶対に upstream や robustonian へは push しない**（権限もない）
+
 ## アップグレード手順（Ubuntu）
 
 ```bash
