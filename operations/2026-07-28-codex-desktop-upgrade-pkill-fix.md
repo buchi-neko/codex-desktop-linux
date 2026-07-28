@@ -57,7 +57,8 @@ pkill -f "codex app-[s]erver"
 ```
 
 - キャッシュは再起動時に自動再取得（285,588 → 304,145 bytes）
-- app-server は electron 停止に伴い既に落ちていた（pkill は該当なしで終了）
+- ~~app-server は electron 停止に伴い既に落ちていた（pkill は該当なしで終了）~~
+  → **この記述は誤り。§6 で訂正**（pkill が空振りしただけで、実際は古いプロセスが生存していた）
 
 ### 5. 踏んだ罠: pkill が実行中のシェルを巻き添えにする
 
@@ -72,11 +73,64 @@ pkill -f "/opt/codex-desktop/[e]lectron"   # ブラケットが必須
 pkill -f "codex app-[s]erver"
 ```
 
+### 6. 【訂正・追調査】孤児化した app-server が15日間居座っていた
+
+別マシン（Mac）からの指摘を受けて再調査したところ、**§4 の「app-server は既に落ちていた」は誤り**だった。
+
+#### 実際に起きていたこと
+
+`pkill -f "codex app-[s]erver"` が exit 1（該当なし）を返したのは、プロセスが
+いなかったからではなく**パターンが実プロセスに一致しなかったから**。実際の
+コマンドラインは `codex` と `app-server` の間に `-c features.code_mode_host=true`
+が挟まっており、連続文字列としてはマッチしない。
+
+そのうえで、electron を kill しても app-server は道連れにならず、親を失って
+`systemd --user` に再ペアレントされ孤児として生存し続けていた。
+
+| 対象 | 起動 | 親 | chatgpt.com接続 |
+|------|------|-----|-----|
+| PID 7156/7164（旧） | 2026-07-13 08:26:54（**15日稼働**） | systemd --user（孤児） | ESTABLISHED 2本 |
+| PID 92221/92232 | 2026-07-28 09:35:26 | electron 91617 → kill後に孤児化 | なし |
+| PID 168436/168472（現行） | 2026-07-28 10:03:47 | electron 166952 | ESTABLISHED 1本 |
+
+古い 7164 が握っていた接続先 `2606:4700:4408::ac40:9bd1` は `chatgpt.com` と一致。
+つまり `--remote-control` のクラウド常時接続を、**7月13日時点の古いコードが
+15日間握り続けていた**。アプリを何度入れ直しても、この経路だけ更新されていなかった。
+
+#### ps/pgrep が使えない環境での調査方法
+
+Claude Code のサンドボックスでは `ps` / `pgrep` が権限で弾かれたため、`/proc` を直接読んだ。
+
+```bash
+# プロセス一覧と正確な起動時刻（/proc/<pid> の mtime は不正確なので stat の starttime を使う）
+btime=$(grep ^btime /proc/stat | awk '{print $2}'); hz=$(getconf CLK_TCK)
+st=$(awk '{print $22}' /proc/<pid>/stat); date -d @$((btime + st/hz))
+
+# 親PID（field 4）— systemd --user なら孤児
+awk '{print $4}' /proc/<pid>/stat
+
+# 保持しているTCP接続 — fdのsocket inodeを/proc/net/tcp6と照合
+#   st列 01=ESTABLISHED, 0A=LISTEN
+```
+
+注意: TCP接続を持つのは node ラッパー（7156）ではなく、その子の**Rustバイナリ実体**（7164）。
+
+#### 対処
+
+```bash
+kill 7156          # 旧孤児（PID直指定なら自己マッチの心配なし。子も一緒に終了する）
+pkill -f "/opt/codex-desktop/[e]lectron"   # Desktop完全再起動 → 9秒で復帰
+kill 92221         # 再起動で新たに孤児化した分も掃除
+```
+
+再起動後、現行 app-server（168472）が5秒以内に chatgpt.com へ ESTABLISHED 接続を
+張り直すことを確認。remote-control 経路は新しいコードで復活した。
+
 ### 変更ファイル
 
 | ファイル | 変更内容 |
 |---------|---------|
-| `CLAUDE.md` | pkill をブラケット表記に修正＋理由を追記、アップグレード手順を `git merge` に訂正、キャッシュ削除とkillが1セットである旨の相互参照を追加 |
+| `CLAUDE.md` | アップグレード手順を `git merge` に訂正、キャッシュ削除とkillが1セットである旨の相互参照を追加、「起動プロセスの入れ替え」に罠3つ（シェル巻き添え / 連続文字列不一致 / app-serverの孤児化）と孤児の判別・検証手順を追記 |
 | `operations/2026-07-28-*.md` | 本ファイル |
 
 コミット: `64a5af3` → `origin/personal/notes` に push 済み
@@ -87,8 +141,10 @@ pkill -f "codex app-[s]erver"
 - [x] `codex --version` → `codex-cli 0.145.0`
 - [x] models_cache.json の再生成を確認（304,145 bytes）
 - [x] モデルID一覧に GPT-5.6系3種を確認: `gpt-5.6-luna` / `gpt-5.6-sol` / `gpt-5.6-terra`（他 `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`）
-- [x] kill 後にアプリが自動再起動することを確認（1秒で復帰）
+- [x] kill 後にアプリが自動再起動することを確認（1秒で復帰、再検証時は9秒）
 - [x] 作業ツリーがクリーンで `origin/personal/notes` と同期していることを確認
+- [x] 【追調査】孤児 app-server をすべて掃除し、残存プロセスの親がすべて electron であることを確認
+- [x] 【追調査】現行 app-server が chatgpt.com へ ESTABLISHED 接続を張り直したことを確認（remote-control 復活）
 
 ## 関連ファイル・リソース
 

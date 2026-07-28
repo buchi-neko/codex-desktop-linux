@@ -59,17 +59,57 @@ make bootstrap-native   # ビルド + .deb + sudoインストール
 `.deb`上書きインストールしても、既に起動中のElectron群は古いバイナリをメモリに保持したまま動き続ける。**手動killが必要**：
 
 ```bash
-pkill -f "/opt/codex-desktop/[e]lectron"
-pkill -f "codex app-[s]erver"
-# start.sh 経由で新版が自動再起動する
+pkill -f "/opt/codex-desktop/[e]lectron"      # Desktop本体（start.sh経由で自動再起動する）
+pkill -f "[a]pp-server --remote-control"      # ← 孤児化するので必ずセットで落とす
 ```
 
-**`[e]` `[s]` のブラケットは必須**（2026-07-28に踏んだ罠）。`pkill -f` はプロセスの
-コマンドライン全体を検索するため、素直に `pkill -f "codex app-server"` と書くと
-**このコマンドを実行しているシェル自身**（コマンドラインに `codex app-server` という
-文字列を含む）にもマッチして、シェルごと巻き添えで死ぬ。
-ブラケットは正規表現の文字クラスなので `[s]erver` は `server` にマッチする一方、
-文字列としての `[s]erver` にはマッチしない → 自己マッチだけを回避できる。
+以下、2026-07-28に実際に踏んだ罠3つ。**どれか1つでも外すと古いプロセスが生き残る**。
+
+### 罠1: `pkill -f` は実行中のシェル自身を巻き添えにする
+
+`pkill -f` はプロセスのコマンドライン全体を検索するため、素直に
+`pkill -f "codex app-server"` と書くと**このコマンドを実行しているシェル自身**
+（コマンドラインにその文字列を含む）にもマッチして、シェルごと死ぬ。
+ブラケットは正規表現の文字クラスなので `[a]pp-server` は `app-server` に
+マッチする一方、文字列としての `[a]pp-server` にはマッチしない
+→ 自己マッチだけを回避できる。**ブラケットは必須**。
+
+### 罠2: `codex app-server` という連続文字列ではマッチしない
+
+実際のコマンドラインは間に引数が挟まる:
+
+```
+node ~/.local/.../codex.js -c features.code_mode_host=true app-server --remote-control ...
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ここが挟まる
+```
+
+`codex` と `app-server` は隣接していないので、`pkill -f "codex app-[s]erver"` は
+**空振りして exit 1（該当なし）を返す**。「該当なし＝もう落ちている」と誤読しやすい。
+`app-server` 側だけでマッチさせること。
+
+### 罠3: electron を kill しても app-server は道連れにならない（最重要）
+
+electron を落としても app-server は終了せず、親を失って `systemd --user` に
+再ペアレントされ**孤児として生き残る**。しかも孤児は chatgpt.com への
+remote-control 接続を握ったままなので、新しい Desktop を起動しても
+**7月13日時点の古いコードが通信し続けていた**（発見時点で15日間稼働）。
+
+孤児の判別は**親PID**を見る。親が `systemd --user` なら孤児:
+
+```bash
+ps -eo pid,ppid,lstart,args | grep "[a]pp-server"
+ps -p <PPID> -o comm=     # systemd と出たら孤児 → kill する
+```
+
+正常な app-server の親は必ず `/opt/codex-desktop/electron`。
+kill は PID直指定が最も安全（自己マッチの心配がない）。親を落とせば子も終了する。
+
+### 入れ替え後の検証
+
+remote-control が復活したかは、app-server の実体（Rustバイナリの子プロセス）が
+chatgpt.com へ ESTABLISHED 接続を張っているかで判定する。
+`ps`/`pgrep` が使えない環境では `/proc/<pid>/fd` の socket inode を
+`/proc/net/tcp6` と照合する（手順は `operations/2026-07-28-*.md` 参照）。
 
 ## 設定・状態ファイルの場所
 
