@@ -314,6 +314,8 @@ pub struct RuntimeManager {
     cleanup_join: Mutex<Option<thread::JoinHandle<()>>>,
     cleanup_timing: ProcessCleanupTiming,
     extension_id: Option<String>,
+    #[cfg(test)]
+    current_executable_identity_override: Option<FileIdentity>,
     lifecycle: Mutex<()>,
     manifest_paths_override: Option<Vec<PathBuf>>,
     next_process_instance: AtomicU64,
@@ -352,6 +354,8 @@ impl RuntimeManager {
             cleanup_join: Mutex::new(None),
             cleanup_timing,
             extension_id,
+            #[cfg(test)]
+            current_executable_identity_override: None,
             lifecycle: Mutex::new(()),
             manifest_paths_override,
             next_process_instance: AtomicU64::new(1),
@@ -414,9 +418,13 @@ impl RuntimeManager {
         })?)?;
         self.validate_invocation(&constraints)?;
         let client_id = normalized_client_id(params.get("clientId"))?;
-        let mut entry =
-            select_runtime_entry(&constraints, self.manifest_paths_override.as_deref())?;
-        validate_runtime_entry(&mut entry)?;
+        let current_executable_identity = self.current_executable_identity()?;
+        let mut entry = select_runtime_entry_for_host(
+            &constraints,
+            self.manifest_paths_override.as_deref(),
+            &current_executable_identity,
+        )?;
+        validate_runtime_entry_for_host(&mut entry, &current_executable_identity)?;
         let _lifecycle = self
             .lifecycle
             .lock()
@@ -1036,6 +1044,30 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_test_with_current_executable_path(
+        extension_id: String,
+        runtime_root: PathBuf,
+        manifest_path: PathBuf,
+        current_executable_path: &Path,
+    ) -> Self {
+        let mut manager = Self::for_test(extension_id, runtime_root, manifest_path);
+        manager.current_executable_identity_override = Some(
+            file_identity(current_executable_path)
+                .expect("test current executable path should identify a file"),
+        );
+        manager
+    }
+
+    fn current_executable_identity(&self) -> RuntimeResult<FileIdentity> {
+        #[cfg(test)]
+        if let Some(identity) = &self.current_executable_identity_override {
+            return Ok(*identity);
+        }
+
+        current_executable_identity()
+    }
+
+    #[cfg(test)]
     pub(crate) fn running_process_count(&self) -> usize {
         let processes = self
             .processes
@@ -1096,9 +1128,19 @@ fn parse_constraints(value: &Value) -> RuntimeResult<RuntimeConstraints> {
         .map_err(|_| RuntimeError::invalid_params("Invalid Codex runtime constraints"))
 }
 
+#[cfg(test)]
 fn select_runtime_entry(
     constraints: &RuntimeConstraints,
     manifest_paths_override: Option<&[PathBuf]>,
+) -> RuntimeResult<RuntimeEntry> {
+    let current_host = current_executable_identity()?;
+    select_runtime_entry_for_host(constraints, manifest_paths_override, &current_host)
+}
+
+fn select_runtime_entry_for_host(
+    constraints: &RuntimeConstraints,
+    manifest_paths_override: Option<&[PathBuf]>,
+    current_host: &FileIdentity,
 ) -> RuntimeResult<RuntimeEntry> {
     let manifest_paths = manifest_paths_override
         .map(<[PathBuf]>::to_vec)
@@ -1140,7 +1182,6 @@ fn select_runtime_entry(
         ));
     }
 
-    let current_host = current_executable_identity()?;
     let mut matching = entries
         .into_iter()
         .filter_map(|entry| serde_json::from_value::<RuntimeEntry>(entry).ok())
@@ -1149,7 +1190,7 @@ fn select_runtime_entry(
                 && fs::canonicalize(&entry.paths.extension_host_path)
                     .ok()
                     .and_then(|path| file_identity(&path).ok())
-                    .is_some_and(|identity| identity == current_host)
+                    .is_some_and(|identity| &identity == current_host)
         })
         .collect::<Vec<_>>();
     matching.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -1188,7 +1229,10 @@ fn manifest_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn validate_runtime_entry(entry: &mut RuntimeEntry) -> RuntimeResult<()> {
+fn validate_runtime_entry_for_host(
+    entry: &mut RuntimeEntry,
+    current_exe: &FileIdentity,
+) -> RuntimeResult<()> {
     if entry.entry_id.trim().is_empty()
         || entry.install_id.trim().is_empty()
         || entry.app_version.trim().is_empty()
@@ -1215,10 +1259,9 @@ fn validate_runtime_entry(entry: &mut RuntimeEntry) -> RuntimeResult<()> {
         validate_owned_dir(path, false)?;
     }
 
-    let current_exe = current_executable_identity()?;
     let configured_host = file_identity(&entry.paths.extension_host_path)
         .map_err(|_| required_path_error("extensionHostPath"))?;
-    if current_exe != configured_host {
+    if current_exe != &configured_host {
         return Err(RuntimeError::typed(
             "no_matching_codex_install",
             "No compatible Codex app-server entry was found",
@@ -1283,16 +1326,20 @@ fn validate_trusted_parent_chain(path: &Path) -> RuntimeResult<()> {
         if metadata.uid() != euid && metadata.uid() != 0 {
             return Err(required_path_error("parent"));
         }
-        if has_unsafe_write_permissions(&metadata) && !is_root_owned_sticky_directory(&metadata) {
+        if has_unsafe_write_permissions(&metadata)
+            && !is_root_owned_sticky_directory(metadata.uid(), metadata.permissions().mode())
+        {
             return Err(required_path_error("parent"));
         }
     }
     Ok(())
 }
 
-fn is_root_owned_sticky_directory(metadata: &fs::Metadata) -> bool {
-    let mode = metadata.permissions().mode();
-    metadata.uid() == 0 && mode & libc::S_ISVTX != 0 && mode & 0o002 != 0
+fn is_root_owned_sticky_directory(uid: u32, mode: u32) -> bool {
+    // Sticky-directory semantics protect existing entries regardless of whether
+    // write access is granted through the group bit (for example, a 1775 Nix
+    // store) or the world bit (the usual 1777 /tmp case).
+    uid == 0 && mode & libc::S_ISVTX != 0
 }
 
 fn current_executable_identity() -> RuntimeResult<FileIdentity> {
@@ -2924,6 +2971,14 @@ mod tests {
         assert!(validate_owned_file(&executable, true).is_ok());
         assert!(validate_owned_dir(&root, true).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_owned_sticky_directory_accepts_nix_store_permissions() {
+        assert!(is_root_owned_sticky_directory(0, 0o1775));
+        assert!(is_root_owned_sticky_directory(0, 0o1777));
+        assert!(!is_root_owned_sticky_directory(0, 0o0775));
+        assert!(!is_root_owned_sticky_directory(1, 0o1775));
     }
 
     #[test]

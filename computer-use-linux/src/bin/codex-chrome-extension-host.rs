@@ -7,6 +7,7 @@ use std::{
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
     net::Shutdown,
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, PermissionsExt},
         io::AsRawFd,
         net::{UnixListener, UnixStream},
@@ -26,7 +27,8 @@ use chrome_runtime::RuntimeManager;
 const HOST_NAME: &str = "com.openai.codexextension";
 const SOCKET_DIR_ENV: &str = "CODEX_BROWSER_USE_SOCKET_DIR";
 const SESSIONS_DIR_ENV: &str = "CODEX_BROWSER_USE_SESSIONS_DIR";
-const DEFAULT_SOCKET_DIR: &str = "/tmp/codex-browser-use";
+const SOCKET_DIR_NAME: &str = "codex-browser-use";
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const ROLLOUT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const OBSERVED_TURN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ROLLOUT_SEARCH_MAX_DEPTH: usize = 5;
@@ -330,9 +332,10 @@ impl RolloutTracker {
 }
 
 fn main() -> Result<()> {
-    let socket_dir = socket_dir();
+    let effective_uid = unsafe { libc::geteuid() };
+    let socket_dir = socket_dir(effective_uid);
+    let socket_path = socket_path(&socket_dir)?;
     prepare_socket_dir(&socket_dir)?;
-    let socket_path = socket_path(&socket_dir);
     remove_socket_if_present(&socket_path)?;
 
     let listener = UnixListener::bind(&socket_path)
@@ -364,10 +367,16 @@ fn main() -> Result<()> {
     result
 }
 
-fn socket_dir() -> PathBuf {
-    env::var_os(SOCKET_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET_DIR))
+fn socket_dir(effective_uid: u32) -> PathBuf {
+    if let Some(path) = env::var_os(SOCKET_DIR_ENV).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+
+    default_socket_dir(effective_uid)
+}
+
+fn default_socket_dir(effective_uid: u32) -> PathBuf {
+    PathBuf::from(format!("/tmp/{SOCKET_DIR_NAME}-{effective_uid}"))
 }
 
 fn sessions_root() -> Option<PathBuf> {
@@ -397,12 +406,23 @@ fn is_extension_id(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| matches!(byte, b'a'..=b'p'))
 }
 
-fn socket_path(socket_dir: &Path) -> PathBuf {
+fn socket_path(socket_dir: &Path) -> Result<PathBuf> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    socket_dir.join(format!("extension-{}-{nonce}.sock", process::id()))
+    socket_path_for(socket_dir, process::id(), nonce)
+}
+
+fn socket_path_for(socket_dir: &Path, process_id: u32, nonce: u128) -> Result<PathBuf> {
+    let path = socket_dir.join(format!("extension-{process_id}-{nonce}.sock"));
+    if path.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+        bail!(
+            "unix socket path exceeds the {MAX_UNIX_SOCKET_PATH_BYTES}-byte Linux limit: {}",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 fn prepare_socket_dir(path: &Path) -> Result<()> {
@@ -1028,6 +1048,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn socket_directory_default_is_scoped_by_uid() {
+        assert_eq!(
+            default_socket_dir(1000),
+            PathBuf::from("/tmp/codex-browser-use-1000")
+        );
+    }
+
+    #[test]
+    fn complete_socket_path_is_guarded_against_the_linux_limit() {
+        let short = socket_path_for(Path::new("/tmp/codex-browser-use-1000"), 42, 7).unwrap();
+        assert_eq!(
+            short,
+            PathBuf::from("/tmp/codex-browser-use-1000/extension-42-7.sock")
+        );
+
+        let long_dir = PathBuf::from("/tmp").join("x".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+        let error = socket_path_for(&long_dir, 42, 7).unwrap_err();
+        assert!(error.to_string().contains("unix socket path exceeds"));
+    }
+
+    #[test]
     fn frame_round_trip_uses_native_length_prefix() {
         let message = json!({ "jsonrpc": "2.0", "id": "1", "method": "ping" });
         let mut encoded = Vec::new();
@@ -1234,9 +1275,14 @@ while True:
         )
         .unwrap();
         fs::set_permissions(&fake_cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let fake_node = root.join("fake-node");
+        fs::write(&fake_node, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&fake_node, fs::Permissions::from_mode(0o700)).unwrap();
 
         let extension_id = "abcdefghijklmnopabcdefghijklmnop";
-        let current_exe = env::current_exe().unwrap();
+        let extension_host_path = root.join("extension-host");
+        fs::copy(env::current_exe().unwrap(), &extension_host_path).unwrap();
+        fs::set_permissions(&extension_host_path, fs::Permissions::from_mode(0o700)).unwrap();
         let manifest_path = root.join("chrome-native-hosts-v2.json");
         fs::write(
             &manifest_path,
@@ -1258,8 +1304,8 @@ while True:
                     "paths": {
                         "codexCliPath": fake_cli,
                         "codexHome": codex_home,
-                        "extensionHostPath": current_exe.clone(),
-                        "nodePath": current_exe,
+                        "extensionHostPath": extension_host_path,
+                        "nodePath": fake_node,
                         "resourcesPath": resources
                     },
                     "proxyHost": "127.0.0.1",
@@ -1272,10 +1318,11 @@ while True:
         .unwrap();
         fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let runtime_manager = Arc::new(RuntimeManager::for_test(
+        let runtime_manager = Arc::new(RuntimeManager::for_test_with_current_executable_path(
             extension_id.to_string(),
             runtime_root.clone(),
             manifest_path,
+            &extension_host_path,
         ));
         let (mut host_state, output) = test_host_state_with_output();
         host_state.runtime_manager = Arc::clone(&runtime_manager);

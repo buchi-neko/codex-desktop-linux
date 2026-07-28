@@ -23,6 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed
 
+- Remote mobile control now relies on the current upstream account-enrollment
+  compatibility and Connections tab resolver instead of patching duplicate
+  Linux-specific fallbacks into those paths.
 - Remote notification hydration, replay, completed-item recovery, and remote
   terminal-status recovery are no longer part of the default Linux patch set and
   remain owned by the disabled-by-default `remote-mobile-control` feature.
@@ -32,10 +35,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Concurrent updater entrypoints now serialize state reloads and cache cleanup
+  before persisting startup state. A second process can no longer prune an
+  active rebuild workspace, while forced checks wait for startup maintenance
+  instead of returning without checking upstream, and manual ready-package
+  installs cannot race daemon reconciliation into launching the same install
+  twice.
+- Updater rebuild workspaces now retain the Git identity of the wrapper source
+  after `.git` is stripped, so installed build metadata and packaged
+  update-builder metadata report the wrapper commit instead of `unknown`.
+- V2 pets now look toward the live pointer position after successful Linux
+  Computer Use click, scroll, and drag actions, then return to their normal
+  animation. The bridge is isolated per app instance and fails softly when its
+  private runtime socket is unavailable.
+- The updater daemon now detects that a package upgrade replaced its binary
+  on disk and exits with a nonzero status so systemd's `Restart=on-failure`
+  relaunches it on the new binary. Previously a running daemon survived every
+  upgrade and kept staging rebuild workspaces with outdated logic, failing
+  each periodic update until the next reboot.
+- Launcher startup no longer requires Python's pidfd wrappers for normal
+  launcher lock acquire and release. Pidfd remains reserved for the
+  identity-verified stale Electron termination path.
+- Approval notifications now preserve the upstream Approve, Approve for
+  session, and Decline actions on Linux. A small freedesktop notification
+  bridge forwards the action and close signals that Electron's Linux
+  notification backend does not expose, with the existing View-only Electron
+  notification retained as a fail-soft fallback.
+- The opt-in `frameless-titlebar` feature now removes Electron-drawn window
+  controls from Quick Chat as well as the primary window, keeping compositor-
+  managed decoration behavior consistent across both window types.
+- Remote mobile cold starts now select one runtime owner deterministically.
+  Explicit systemd user-service configuration takes precedence over the
+  Desktop app-server and standalone fallback, while a versioned Desktop marker
+  prevents stale or forged marker content from suppressing the fallback.
+- Remote mobile device keys now use a bounded, versioned file store with
+  serialized read-modify-write updates and crash-durable atomic replacement.
+  Unsafe paths, file types, ownership, permissions, malformed records, and
+  oversized stores fail closed instead of being followed or silently erased.
 - Remote mobile control now patches the current upstream webview chunks for
   feature sync, settings visibility, host enablement, and active conversation
-  status. The enablement bridge also accepts the current bundle ordering where
-  its log marker is declared after the request handler.
+  status. Revoking the final controller now also clears the current mobile setup
+  state. The enablement bridge accepts the current bundle ordering where its log
+  marker is declared after the request handler.
 - Automated user-local updates no longer inherit or set developer overrides
   that could replace a running Electron app or bypass DMG acceptance. Manual
   and timer rebuilds now fail safely at promotion, transactional installs retain
