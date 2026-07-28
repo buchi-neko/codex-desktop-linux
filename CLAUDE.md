@@ -21,9 +21,16 @@
 ## アップグレード手順（Ubuntu）
 
 ```bash
-git fetch upstream && git pull --ff-only upstream main
+git fetch upstream && git merge upstream/main --no-edit
 make bootstrap-native   # ビルド + .deb + sudoインストール
 ```
+
+`personal/notes` には個人メモの独自コミットが載っているため `git pull --ff-only` は
+**使えない**（fast-forwardできない）。merge を使うこと。
+
+その後、新モデルを確実に拾うには下記2つまでやって1セット:
+1. `rm ~/.codex/models_cache.json`（→「新モデルが出ないときのチェックリスト」3番）
+2. 起動中プロセスのkill（→「起動プロセスの入れ替え」）
 
 ## 新モデル（GPT-5.6等）が出ないときのチェックリスト
 
@@ -52,10 +59,17 @@ make bootstrap-native   # ビルド + .deb + sudoインストール
 `.deb`上書きインストールしても、既に起動中のElectron群は古いバイナリをメモリに保持したまま動き続ける。**手動killが必要**：
 
 ```bash
-pkill -f "/opt/codex-desktop/electron"
-pkill -f "codex app-server"
+pkill -f "/opt/codex-desktop/[e]lectron"
+pkill -f "codex app-[s]erver"
 # start.sh 経由で新版が自動再起動する
 ```
+
+**`[e]` `[s]` のブラケットは必須**（2026-07-28に踏んだ罠）。`pkill -f` はプロセスの
+コマンドライン全体を検索するため、素直に `pkill -f "codex app-server"` と書くと
+**このコマンドを実行しているシェル自身**（コマンドラインに `codex app-server` という
+文字列を含む）にもマッチして、シェルごと巻き添えで死ぬ。
+ブラケットは正規表現の文字クラスなので `[s]erver` は `server` にマッチする一方、
+文字列としての `[s]erver` にはマッチしない → 自己マッチだけを回避できる。
 
 ## 設定・状態ファイルの場所
 
