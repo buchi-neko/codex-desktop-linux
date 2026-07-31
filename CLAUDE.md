@@ -32,6 +32,9 @@ make bootstrap-native   # ビルド + .deb + sudoインストール
 1. `rm ~/.codex/models_cache.json`（→「新モデルが出ないときのチェックリスト」3番）
 2. 起動中プロセスのkill（→「起動プロセスの入れ替え」）
 
+`linux-features/features.json` は gitignore 対象なので merge では変化しないが、
+**消えていると独自機能が無効のままビルドされる**（→「有効化しているLinux機能」）。
+
 ## 新モデル（GPT-5.6等）が出ないときのチェックリスト
 
 新モデル対応は **3段構え** で、どれか1つでも古いとUIに出ない：
@@ -101,6 +104,14 @@ ps -eo pid,ppid,lstart,args | grep "[a]pp-server"
 ps -p <PPID> -o comm=     # systemd と出たら孤児 → kill する
 ```
 
+`ps` / `pgrep` ごと権限で弾かれることがある（2026-07-31に遭遇）。その場合は `/proc` を直接読む:
+
+```bash
+grep -al "app-server" /proc/[0-9]*/cmdline        # PIDを特定
+tr '\0' ' ' < /proc/<pid>/cmdline                  # コマンドライン
+awk '/^PPid:/{print $2}' /proc/<pid>/status        # 親PID
+```
+
 正常な app-server の親は必ず `/opt/codex-desktop/electron`。
 kill は PID直指定が最も安全（自己マッチの心配がない）。親を落とせば子も終了する。
 
@@ -108,8 +119,59 @@ kill は PID直指定が最も安全（自己マッチの心配がない）。�
 
 remote-control が復活したかは、app-server の実体（Rustバイナリの子プロセス）が
 chatgpt.com へ ESTABLISHED 接続を張っているかで判定する。
-`ps`/`pgrep` が使えない環境では `/proc/<pid>/fd` の socket inode を
+
+```bash
+ss -tnp | grep "pid=<app-serverのPID>"    # :443 へ ESTAB が出れば復活
+```
+
+`ss` も `ps` も使えない環境では `/proc/<pid>/fd` の socket inode を
 `/proc/net/tcp6` と照合する（手順は `operations/2026-07-28-*.md` 参照）。
+
+## 有効化しているLinux機能（linux-features/features.json）
+
+このforkは公式にない機能を `linux-features/` に持ち、`features.json` で選んだものだけを
+ビルド時にupstreamバンドルへパッチとして当てる。
+
+**重要: `features.json` は `.gitignore` 対象**（`.gitignore:18`）。gitに残らないので、
+cloneし直したりファイルを失うと**有効化が消え、次のリビルドで対策ごと巻き戻る**。
+
+| 機能ID | 有効化 | 目的 |
+|--------|--------|------|
+| `remote-mobile-control` | 既存 | スマホからのリモート操作 |
+| `shallow-repository-watches` | 2026-07-31 | inotify枯渇の防止（下記） |
+
+### shallow-repository-watches（inotify枯渇対策）
+
+サイドバーでタスクをホバーすると、Electronがそのリポジトリ全体へ再帰的な `fs.watch` を張る。
+Linux版Nodeの再帰監視は**ファイル・ディレクトリ1個ごとにinotify枠を1個消費する**実装なので、
+巨大リポジトリを一度覗いただけでユーザー上限（既定65,536）を使い切る。
+
+2026-07-31の実測: `ai-news-collector`（111,557エントリ）のプレビューで Codex Desktop が
+62,664 watch を確保し `ENOSPC` が614回発生。systemd user unit の監視まで巻き添えになった。
+
+パッチはLinuxの再帰要求だけを非再帰へ落とす（実質3行）。代償は、深い階層の変更が即時反映されず
+**ウィンドウのフォーカス復帰時に更新される**こと。日常操作ではほぼ気づかない。
+
+競合機能 `directory-only-working-tree-watch` とは**同時に有効化できない**（どちらか一方）。
+
+適用確認は2段階でやる。`ciPolicy: optional` のため **パッチが外れてもビルドは成功扱いで進む**
+（警告のみ）。upstream更新でバンドル形状が変わるとパターンが外れるので毎回確認すること:
+
+```bash
+grep "feature shallow-repository-watches" <ビルドログ>   # applied=1 なら成功
+grep -a -c "codexLinuxShallowRepositoryWatches" /opt/codex-desktop/resources/app.asar   # 1
+```
+
+効果の実測（上限は `/proc/sys/fs/inotify/max_user_watches`）:
+
+```bash
+{ for f in /proc/[0-9]*/cmdline; do pid=${f%/cmdline}; pid=${pid#/proc/}
+  case "$(tr '\0' ' ' < "$f")" in */opt/codex-desktop/*|*@openai/codex*)
+    grep -h '^inotify' /proc/$pid/fdinfo/* | wc -l;; esac
+done; } 2>/dev/null | paste -sd+ | bc
+```
+
+対策後の正常値は数十以下（2026-07-31の実測で17）。数千〜数万なら効いていない。
 
 ## 設定・状態ファイルの場所
 
@@ -121,6 +183,8 @@ chatgpt.com へ ESTABLISHED 接続を張っているかで判定する。
 | `~/.config/Codex/` | Electronのユーザーデータ（Cookie等） |
 | `/opt/codex-desktop/` | アプリ本体 |
 | `~/.local/lib/node_modules/@openai/codex/` | Codex CLI（Desktopが使用） |
+| `linux-features/features.json` | 有効化するLinux独自機能（**gitignore対象＝gitに残らない**） |
+| `/etc/sysctl.d/99-stock-monitor-inotify.conf` | inotify上限 262,144（stock-monitor側で設定。別管理） |
 
 ## 作業ログ
 
