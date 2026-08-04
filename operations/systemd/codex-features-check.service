@@ -1,0 +1,12 @@
+[Unit]
+Description=Codex Desktop の Linux独自機能が適用されているか検証する
+Documentation=file:///home/hikaru/codex-desktop-linux/operations/systemd/README.md
+
+[Service]
+Type=oneshot
+# 更新直後はインストールが終わりきっていないことがあるので少し待ってから検証する
+ExecStartPre=/bin/sleep 30
+ExecStart=%h/codex-desktop-linux/operations/verify-linux-features.sh --notify
+# 1=パッチ異常 / 2=要再起動 はデスクトップ通知済みなので unit を failed にしない
+# （systemd を degraded にせず、判断はログと通知に任せる）
+SuccessExitStatus=0 1 2

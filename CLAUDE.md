@@ -32,15 +32,24 @@ make bootstrap-native   # ビルド + .deb + sudoインストール
 1. `rm ~/.codex/models_cache.json`（→「新モデルが出ないときのチェックリスト」3番）
 2. 起動中プロセスのkill（→「起動プロセスの入れ替え」）
 
-**最後に必ず検証スクリプトを走らせる**（設定・パッチ・プロセス・監視枠を1本で判定する）:
+**ビルドが成功しても独自機能は静かに外れ得る**（設定がgitignore対象 + パッチがoptional）。
+そのため検証は systemd で自動化してある。`app.asar` の変化を path unit が検知し、
+**手動リビルドでもアプリ内更新でも**自動で検証してデスクトップ通知を出す:
+
+| 通知 | 意味 | 対処 |
+|------|------|------|
+| （出ない） | 正常 | なし |
+| 独自機能が外れています | パッチor設定が失われた | 要リビルド |
+| 再起動してください | 更新は入ったが古いプロセスが動作中 | アプリ再起動 |
+
+手動で確認する場合（設定・パッチ・プロセス・監視枠を1本で判定する）:
 
 ```bash
-bash operations/verify-linux-features.sh
+bash operations/verify-linux-features.sh   # 0=正常 / 1=要リビルド / 2=要再起動
 ```
 
-「すべて正常です」以外が出たら、表示された `[NG]` の指示に従う。
-**ビルドが成功しても独自機能は静かに外れ得る**（設定がgitignore対象 + パッチがoptional）ため、
-この確認を省略しないこと。人間の記憶に頼らずスクリプトに判定させる。
+自動チェックの設置・停止手順は `operations/systemd/README.md`。
+ログは `~/.cache/codex-desktop/feature-check.log`。
 
 ## 新モデル（GPT-5.6等）が出ないときのチェックリスト
 
@@ -162,13 +171,14 @@ Linux版Nodeの再帰監視は**ファイル・ディレクトリ1個ごとにin
 競合機能 `directory-only-working-tree-watch` とは**同時に有効化できない**（どちらか一方）。
 
 `ciPolicy: optional` のため **パッチが外れてもビルドは成功扱いで進む**（警告のみ）。
-upstream更新でバンドル形状が変わるとパターンが外れるので、リビルドのたびに検証する:
+upstream更新でバンドル形状が変わるとパターンが外れる。検証は更新時に自動実行される
+（→「アップグレード手順」）。手動で走らせるなら:
 
 ```bash
 bash operations/verify-linux-features.sh
 ```
 
-手動で確認する場合の内訳:
+内訳を自分で確認する場合:
 
 ```bash
 grep "feature shallow-repository-watches" <ビルドログ>   # applied=1 なら成功

@@ -1,0 +1,13 @@
+[Unit]
+Description=Codex Desktop の更新を検知して Linux独自機能の適用を検証する
+Documentation=file:///home/hikaru/codex-desktop-linux/operations/systemd/README.md
+
+[Path]
+# アプリ本体(app.asar)が置き換わる＝更新された、というシグナル。
+# 手動リビルド(make)でもアプリ内更新でも必ずここが変わるので、経路を問わず検知できる。
+# systemd はファイル監視時に親ディレクトリも見るため、dpkg の rename 置換も拾える。
+PathChanged=/opt/codex-desktop/resources/app.asar
+Unit=codex-features-check.service
+
+[Install]
+WantedBy=default.target

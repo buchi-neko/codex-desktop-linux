@@ -124,7 +124,9 @@ stock-monitor保護の保険として維持を推奨（非目標「原因を隠�
 |---------|---------|
 | `linux-features/features.json` | `shallow-repository-watches` を追加（**gitignore対象＝コミットされない**） |
 | `CLAUDE.md` | 「有効化しているLinux機能」節を新設。`ps`不可時の`/proc`調査手順、`ss`での接続検証、inotify実測コマンドを追記。アップグレード手順に検証スクリプトの実行を組み込み |
-| `operations/verify-linux-features.sh` | **新規**。リビルド後の検証を1コマンド化（設定・パッチ・プロセス新旧・監視枠の4点をOK/NG判定、NGならexit 1） |
+| `operations/verify-linux-features.sh` | **新規**。検証を1コマンド化（設定・パッチ・プロセス新旧・監視枠の4点を判定。`--notify` で自動実行＆通知に対応） |
+| `operations/systemd/codex-features-check.{path,service}` | **新規**。更新を検知して自動検証する systemd user unit |
+| `operations/systemd/README.md` | **新規**。自動チェックの仕組み・設置・通知の読み方 |
 | `operations/2026-07-31-*.md` | 本ファイル |
 
 ## 検証・テスト
@@ -157,6 +159,46 @@ stock-monitor保護の保険として維持を推奨（非目標「原因を隠�
 
 なし。リビルドのたびに必要な再確認は `operations/verify-linux-features.sh` へ機械化した
 （人間の記憶に頼らない。「ビルド成功＝効いている」ではないため）。
+
+## 追記: 検証の自動化（同日）
+
+「検証コマンドを自分で実行するのは難しいので自動でチェックしてほしい。更新をClaude
+セッションのみに限定したほうがいいか」との相談を受けた。
+
+**経路を限定するのではなく、更新イベントを検知する方式を採った。** `app.asar` は
+アプリ本体そのものなので、手動リビルドでもアプリ内更新でも必ず置き換わる。ここに
+systemd path unit を張れば経路を狭めずに全部拾える。
+
+```
+app.asar が変化 → path unit が検知 → 30秒待機 → verify --notify → 問題時のみ通知
+```
+
+### 実測で確認したこと
+
+- **dpkg の rename 方式でも path unit は発火する**。一時的な自己テスト用 unit を作り、
+  `mv new old` で置き換えて発火を確認（systemd はファイル監視時に親ディレクトリも見る）
+- systemd 経由の実行が成功する（`Result=success`）。cwd が異なっても
+  `features.json` を絶対パスで解決できる
+- 終了コード3分岐すべて: `0`=正常 / `1`=パッチ異常 / `2`=要再起動
+
+### テストで見つけた重大バグ
+
+`--notify` 実装の初版で、ログ収集に `output="$(run_checks)"` を使っていた。
+**コマンド置換はサブシェルを作るため、関数内で立てた NG フラグが親シェルへ返らず、
+自動実行モードでは常に exit 0（＝異常を絶対に検知できない）** という状態だった。
+正常系しか試していなければ「動いている」と誤認していた。異常系テストで発覚。
+一時ファイルへのリダイレクト（同一シェルで実行される）に変更して修正済み。
+
+自動チェックそのものが静かに失敗しては本末転倒なので、この種の検証は
+必ず異常系で確かめること。
+
+### 補足調査
+
+- `codex-update-manager.service` は **masked**（無効化済み）。cron・timer にも
+  codex 関連は無く、勝手に更新が走ることはない
+- `/opt/codex-desktop/update-builder/` にリポジトリのソース一式が同梱されており、
+  その中の `features.json` にも `shallow-repository-watches` が入っている。
+  アプリ内更新でも有効化設定は引き継がれる見込み
 
 ## 関連ファイル・リソース
 
